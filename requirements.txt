@@ -1,0 +1,17 @@
+# Core LLM + Agent Framework
+langchain
+langchain-google-genai
+langchain-groq
+langgraph
+langchain-core
+
+# Web App
+streamlit
+
+# API + Environment
+requests
+python-dotenv
+
+# Data Processing
+pandas
+numpy
