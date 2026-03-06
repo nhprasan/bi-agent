@@ -6,6 +6,7 @@ langchain-core
 
 # Web App
 streamlit
+huggingface_hub
 
 # API + Environment
 requests

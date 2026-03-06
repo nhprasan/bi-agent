@@ -8,7 +8,6 @@ and always returns a data_quality dict for the LLM to use as caveats.
 Deals Board:
   - get_pipeline_summary
   - get_owner_performance
-  - get_weighted_pipeline_value
 
 Work Orders Board:
   - get_revenue_summary
@@ -197,61 +196,6 @@ def get_owner_performance() -> dict:
     return {
         "owner_performance": owners,
         "data_quality":      dq,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Tool 3: Weighted Pipeline Value (Deals)
-# ---------------------------------------------------------------------------
-
-def get_weighted_pipeline_value() -> dict:
-    """
-    Maps closure probability to numeric weights and computes a
-    probability-adjusted pipeline value for open deals.
-      High -> 75%, Medium -> 50%, Low -> 25%
-    """
-    PROB_WEIGHTS = {"high": 0.75, "medium": 0.50, "low": 0.25}
-
-    raw = _fetch_all_items(DEALS_BOARD_ID)
-    df  = normalize_deal_funnel(raw)
-
-    open_df        = df[df["deal_status"] == "open"].copy()
-    total_raw      = 0.0
-    total_weighted = 0.0
-    breakdown      = []
-
-    for prob_label, weight in PROB_WEIGHTS.items():
-        tier_df    = open_df[open_df["closure_probability"] == prob_label]
-        with_value = tier_df[tier_df["deal_value_masked"].notna()]  # skip deals with no value filled in
-        raw_val    = with_value["deal_value_masked"].sum(skipna=True)
-        weighted   = raw_val * weight
-        total_raw      += raw_val
-        total_weighted += weighted
-
-        breakdown.append({
-            "closure_probability": prob_label,
-            "weight_pct":          int(weight * 100),
-            "deal_count":          len(tier_df),
-            "deals_with_value":    len(with_value),
-            "raw_pipeline_value":  round(raw_val, 2),
-            "weighted_value":      round(weighted, 2),
-        })
-
-    # deals with no probability set are excluded from the weighted calc
-    no_prob = open_df[
-        ~open_df["closure_probability"].isin(list(PROB_WEIGHTS.keys()))
-    ]
-
-    return {
-        "open_deals_total":          len(open_df),
-        "deals_in_weighted_calc":    int(open_df["closure_probability"].isin(list(PROB_WEIGHTS.keys())).sum()),
-        "deals_excluded_no_prob":    len(no_prob),
-        "raw_pipeline_value":        round(total_raw, 2),
-        "weighted_pipeline_value":   round(total_weighted, 2),
-        "breakdown_by_probability":  breakdown,
-        "data_quality":              _count_missing(open_df, [
-            "closure_probability", "deal_value_masked",
-        ]),
     }
 
 
