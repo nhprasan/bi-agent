@@ -39,6 +39,7 @@ You can answer questions like:
   - Collections: "How much money is outstanding?", "Which clients owe us the most?"
 
 You CANNOT answer questions about:
+  - Weighted or probability-adjusted pipeline values
   - Individual client identities (data is masked)
   - Historical trends over time (no time-series data available)
   - Forecasts or projections

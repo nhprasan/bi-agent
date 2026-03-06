@@ -85,7 +85,6 @@ User (Streamlit UI)
 |---|---|
 | `get_pipeline_summary` | Pipeline value, deal counts by status/stage, open deals by sector and owner |
 | `get_owner_performance` | Win rate, loss rate, won value, open pipeline per BD owner |
-| `get_weighted_pipeline_value` | Probability-adjusted pipeline (High=75%, Medium=50%, Low=25%) |
 | `get_revenue_summary` | Total contracted value, billed, collected, unbilled, receivables |
 | `get_sector_performance` | Revenue, billed, collected, receivables broken down by sector |
 | `get_collections_status` | Outstanding payments, priority AR accounts, stuck work orders |
@@ -145,7 +144,6 @@ Who is our best performing BD rep?
 What is our total contracted revenue vs what we've collected?
 Which sector generates the most revenue?
 How much money is outstanding and who are the priority accounts?
-What is our weighted pipeline value?
 ```
 
 ---
