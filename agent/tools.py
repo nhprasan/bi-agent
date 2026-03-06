@@ -1,403 +1,397 @@
-# All Monday.com API calls live here.
-# Each function fetches live data, cleans it via normalizer.py.
-# The agent in graph.py wraps these as LangChain tools.
+"""
+agent/tools.py
+
+Six BI tools for founder/executive queries.
+Each tool fetches live data, normalizes it, computes analysis,
+and always returns a data_quality dict for the LLM to use as caveats.
+
+Deals Board:
+  - get_pipeline_summary
+  - get_owner_performance
+  - get_weighted_pipeline_value
+
+Work Orders Board:
+  - get_revenue_summary
+  - get_sector_performance
+  - get_collections_status
+"""
+# NOTE: no caching here — every call hits the Monday API fresh.
+# Keeps data live but means two tools in one turn fetch the board separately.
 
 import requests
-import time
-import random
+import pandas as pd
+
 from config import (
     MONDAY_API_KEY,
     MONDAY_API_URL,
     DEALS_BOARD_ID,
     WORK_ORDERS_BOARD_ID,
-    DEALS_COLUMNS,
-    WORK_ORDER_COLUMNS,
-    DEALS_COL_ID_TO_TITLE,
-    WORK_ORDER_COL_ID_TO_TITLE,
 )
-from agent.normalizer import (
-    normalize_date,
-    normalize_month,
-    normalize_sector,
-    normalize_status,
-    to_float,
-    is_header_row,
-    parse_column_values,
-)
+from agent.normalizer import normalize_deal_funnel, normalize_work_orders
 
 
-# ── Shared API helper ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# GraphQL fetch with pagination
+# ---------------------------------------------------------------------------
 
-def _run_query(query: str, max_retries: int = 3) -> dict:
-    """
-    Sends a GraphQL query to Monday.com and returns parsed JSON.
-    Retries on transient failures (network errors, 5xx, rate limits).
-    All tools go through this single function.
-    """
+# Monday.com caps items_page at 500 per request, so we loop using cursors.
+_BOARD_QUERY = """
+query GetBoardItems($board_id: ID!, $limit: Int!, $cursor: String) {
+  boards(ids: [$board_id]) {
+    items_page(limit: $limit, cursor: $cursor) {
+      cursor
+      items {
+        id
+        name
+        column_values {
+          id
+          text
+          type
+        }
+      }
+    }
+  }
+}
+"""
 
+
+def _fetch_all_items(board_id: int) -> dict:
     headers = {
         "Authorization": MONDAY_API_KEY,
         "Content-Type": "application/json",
+        "API-Version": "2024-01",
     }
+    all_items = []
+    cursor = None  # first request has no cursor; Monday returns one if more pages exist
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = requests.post(
-                MONDAY_API_URL,
-                json={"query": query},
-                headers=headers,
-                timeout=30,
-            )
-
-            # Retry on server errors or rate limits
-            if response.status_code >= 500 or response.status_code == 429:
-                raise RuntimeError(
-                    f"Retryable error {response.status_code}: {response.text}"
-                )
-
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Monday API HTTP {response.status_code}: {response.text}"
-                )
-
-            data = response.json()
-
-            if "errors" in data:
-                raise RuntimeError(f"Monday GraphQL error: {data['errors']}")
-
-            return data
-
-        except (requests.RequestException, RuntimeError) as e:
-            if attempt == max_retries:
-                raise RuntimeError(f"Monday API failed after {max_retries} attempts: {e}")
-
-            # Exponential backoff with jitter
-            sleep_time = (2 ** attempt) + random.uniform(0, 1)
-            time.sleep(sleep_time)
-
-
-def _col_ids(column_map: dict) -> str:
-    """
-    Builds the column IDs string for a GraphQL query.
-    Excludes 'name' since that's a top-level item field, not a column value.
-    """
-    ids = [v for k, v in column_map.items() if k != "name"]
-    return ", ".join(f'"{i}"' for i in ids)
-
-
-# ── Tool 1: Fetch Deals ──────────────────────────────────────────────────────
-
-def fetch_deals(
-    sector: str = None,
-    status: str = None,
-    stage: str = None,
-) -> list:
-    """
-    Fetches all deals from the Deal Funnel board.
-    Optional filters: sector, deal status (Open/Won/Dead etc.), deal stage.
-    Returns a list of clean deal dicts.
-    """
-    query = f"""
-    query {{
-      boards(ids: [{DEALS_BOARD_ID}]) {{
-        items_page(limit: 500) {{
-          items {{
-            id
-            name
-            column_values(ids: [{_col_ids(DEALS_COLUMNS)}]) {{
-              id
-              text
-            }}
-          }}
-        }}
-      }}
-    }}
-    """
-    raw = _run_query(query)
-
-    try:
-        items = raw["data"]["boards"][0]["items_page"]["items"]
-    except (KeyError, IndexError):
-        return []
-
-    results = []
-    for item in items:
-        parsed = parse_column_values(item.get("column_values", []), DEALS_COLUMNS)
-
-        deal = {
-            "id":   item.get("id"),
-            "name": item.get("name", "").strip(),
-            **parsed,
+    while True:
+        payload = {
+            "query": _BOARD_QUERY,
+            "variables": {
+                "board_id": str(board_id),
+                "limit": 500,
+                "cursor": cursor,
+            },
         }
+        response = requests.post(MONDAY_API_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
 
-        # Drop accidental Excel header rows
-        if is_header_row(item, DEALS_COL_ID_TO_TITLE):
-            continue
+        board_data = data["data"]["boards"][0]["items_page"]
+        all_items.extend(board_data["items"])
 
-        # Normalize sector to canonical form
-        deal["sector"] = normalize_sector(deal.get("sector", ""))
+        cursor = board_data.get("cursor")
+        if not cursor:  # no cursor = last page
+            break
 
-        for field in ["close_date_actual", "tentative_close_date", "created_date"]:
-            deal[field] = normalize_date(deal.get(field, ""))
-
-        # Convert deal value to float (Monday returns it as string)
-        deal["deal_value"] = to_float(deal.get("deal_value"))
-
-        # Apply optional filters
-        if sector and deal["sector"] != normalize_sector(sector):
-            continue
-        if status and status.lower() not in deal.get("deal_status", "").lower():
-            continue
-        if stage and stage.lower() not in deal.get("deal_stage", "").lower():
-            continue
-
-        results.append(deal)
-
-    return results
+    # rewrap into the same shape the normalizer expects
+    return {"data": {"boards": [{"items_page": {"items": all_items}}]}}
 
 
-# ── Tool 2: Fetch Work Orders ────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Data quality helper
+# ---------------------------------------------------------------------------
 
-def fetch_work_orders(
-    sector: str = None,
-    execution_status: str = None,
-    billing_status: str = None,
-) -> list:
+def _count_missing(df: pd.DataFrame, cols: list) -> dict:
     """
-    Fetches all work orders from the Work Orders board.
-    Optional filters: sector, execution status, billing status.
-    Returns a list of clean work order dicts.
+    Returns {col: missing_count} for columns with any missing values,
+    plus total_rows. The LLM uses this to compute percentages and add caveats.
     """
-    query = f"""
-    query {{
-      boards(ids: [{WORK_ORDERS_BOARD_ID}]) {{
-        items_page(limit: 500) {{
-          items {{
-            id
-            name
-            column_values(ids: [{_col_ids(WORK_ORDER_COLUMNS)}]) {{
-              id
-              text
-            }}
-          }}
-        }}
-      }}
-    }}
-    """
-    raw = _run_query(query)
-
-    try:
-        items = raw["data"]["boards"][0]["items_page"]["items"]
-    except (KeyError, IndexError):
-        return []
-
-    # Financial fields that need to be converted from string to float
-    financial_fields = [
-        "amount_excl_gst", "amount_incl_gst",
-        "billed_excl_gst", "billed_incl_gst",
-        "collected_incl_gst", "to_be_billed_excl_gst",
-        "to_be_billed_incl_gst", "amount_receivable",
-    ]
-
-    results = []
-    for item in items:
-        parsed = parse_column_values(item.get("column_values", []), WORK_ORDER_COLUMNS)
-
-        wo = {
-            "id":   item.get("id"),
-            "name": item.get("name", "").strip(),
-            **parsed,
-        }
-
-        # Drop accidental Excel header rows
-        if is_header_row(item, WORK_ORDER_COL_ID_TO_TITLE):
+    result = {"total_rows": len(df)}
+    for col in cols:
+        if col not in df.columns:
             continue
-
-        # Normalize fields
-        wo["sector"] = normalize_sector(wo.get("sector", ""))
-        wo["billing_status"] = normalize_status(wo.get("billing_status", ""))
-        wo["last_recurring_month"] = normalize_month(wo.get("last_recurring_month", ""))
-        wo["actual_billing_month"] = normalize_month(wo.get("actual_billing_month", ""))
-
-        for field in ["data_delivery_date", "po_loi_date", "probable_start_date", 
-                      "probable_end_date", "last_invoice_date"]:
-            wo[field] = normalize_date(wo.get(field, ""))
-
-        for field in financial_fields:
-            wo[field] = to_float(wo.get(field))
-
-        # Apply optional filters
-        if sector and wo["sector"] != normalize_sector(sector):
-            continue
-        if execution_status and execution_status.lower() not in wo.get("execution_status", "").lower():
-            continue
-        if billing_status and billing_status.lower() not in wo.get("billing_status", "").lower():
-            continue
-
-        results.append(wo)
-
-    return results
+        # treat None, NaN, and blank strings uniformly as missing
+        missing = df[col].apply(
+            lambda v: v is None
+            or (isinstance(v, float) and pd.isna(v))
+            or (isinstance(v, str) and v.strip() == "")
+        ).sum()
+        if missing > 0:
+            result[col] = int(missing)
+    return result
 
 
-# ── Tool 3: Pipeline Summary ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Tool 1: Pipeline Summary (Deals)
+# ---------------------------------------------------------------------------
 
-def get_pipeline_summary(sector: str = None) -> dict:
-    """
-    Aggregates deals into a pipeline overview grouped by sector.
-    """
-    deals = fetch_deals(sector=sector)
+def get_pipeline_summary() -> dict:
+    raw = _fetch_all_items(DEALS_BOARD_ID)
+    df  = normalize_deal_funnel(raw)
 
-    by_sector = {}
-    total_value = 0.0
-    missing_value_count = 0
+    # split early — most metrics below are scoped to either open or won deals
+    open_df = df[df["deal_status"] == "open"].copy()
+    won_df  = df[df["deal_status"] == "won"].copy()
 
-    for deal in deals:
-        s = deal.get("sector") or "Unknown"
-        value = deal.get("deal_value")
-        stage = deal.get("deal_stage") or "Unknown"
-        status = deal.get("deal_status") or "Unknown"
-
-        if value is None:
-            missing_value_count += 1
-            value = 0.0
-        total_value += value
-
-        if s not in by_sector:
-            by_sector[s] = {"deal_count": 0, "total_value": 0.0, "by_stage": {}, "by_status": {}}
-
-        by_sector[s]["deal_count"] += 1
-        by_sector[s]["total_value"] += value
-        by_sector[s]["by_stage"][stage] = by_sector[s]["by_stage"].get(stage, 0) + 1
-        by_sector[s]["by_status"][status] = by_sector[s]["by_status"].get(status, 0) + 1
-
-    return {
-        "total_deals": len(deals),
-        "total_pipeline_value": total_value,
-        "deals_with_value": len(deals) - missing_value_count,
-        "deals_missing_value": missing_value_count,
-        "by_sector": by_sector,
-    }
-
-
-# ── Tool 4: Revenue Summary ──────────────────────────────────────────────────
-
-def get_revenue_summary(sector: str = None) -> dict:
-    """
-    Aggregates work order financials grouped by sector.
-    """
-    work_orders = fetch_work_orders(sector=sector)
-
-    by_sector = {}
-    totals = {
-        # Revenue (Ex GST)
-        "contract_value": 0.0,
-        "billed": 0.0,
-        "to_be_billed": 0.0,
-        
-        # Cash (Incl GST)
-        "collected": 0.0,
-        "receivable": 0.0,
-        }
-
-    for wo in work_orders:
-        s = wo.get("sector") or "Unknown"
-
-        contract   = wo.get("amount_excl_gst") or 0.0
-        billed     = wo.get("billed_excl_gst") or 0.0
-        collected  = wo.get("collected_incl_gst") or 0.0
-        receivable = wo.get("amount_receivable") or 0.0
-        to_bill    = wo.get("to_be_billed_excl_gst") or 0.0
-
-        totals["contract_value"] += contract
-        totals["billed"]         += billed
-        totals["collected"]      += collected
-        totals["receivable"]     += receivable
-        totals["to_be_billed"]   += to_bill
-
-        if s not in by_sector:
-            by_sector[s] = {"work_order_count": 0, "contract_value": 0.0,
-                            "billed": 0.0, "collected": 0.0,
-                            "receivable": 0.0, "to_be_billed": 0.0}
-
-        by_sector[s]["work_order_count"] += 1
-        by_sector[s]["contract_value"]   += contract
-        by_sector[s]["billed"]           += billed
-        by_sector[s]["collected"]        += collected
-        by_sector[s]["receivable"]       += receivable
-        by_sector[s]["to_be_billed"]     += to_bill
-
-    # Billing efficiency = how much of contract value has been invoiced
-    billing_eff = (
-        totals["billed"] / totals["contract_value"]
-        if totals["contract_value"] > 0 else 0.0
+    # sector and owner breakdowns are open-only; skip rows with blank values
+    sector_breakdown = (
+        open_df[open_df["sector"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+        .groupby("sector")
+        .agg(deal_count=("deal_name", "count"), pipeline_value=("deal_value_masked", "sum"))
+        .reset_index()
+        .sort_values("pipeline_value", ascending=False)
+        .to_dict(orient="records")
     )
 
-    collection_eff = (
-        totals["collected"] / totals["billed"]
-        if totals["billed"] > 0 else 0.0
+    owner_breakdown = (
+        open_df[open_df["owner_code"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+        .groupby("owner_code")
+        .agg(deal_count=("deal_name", "count"), pipeline_value=("deal_value_masked", "sum"))
+        .reset_index()
+        .sort_values("pipeline_value", ascending=False)
+        .to_dict(orient="records")
+    )
+
+    return {
+        "status_counts":        df["deal_status"].value_counts().to_dict(),  # open/won/dead/on hold
+        "open_deals_count":     len(open_df),
+        "total_pipeline_value": round(open_df["deal_value_masked"].sum(skipna=True), 2),
+        "total_won_value":      round(won_df["deal_value_masked"].sum(skipna=True), 2),
+        "stage_breakdown":      open_df["deal_stage"].value_counts().to_dict(),
+        "sector_breakdown":     sector_breakdown,
+        "owner_breakdown":      owner_breakdown,
+        "data_quality":         _count_missing(df, [
+            "deal_value_masked", "deal_status", "deal_stage",
+            "sector", "owner_code", "closure_probability", "tentative_close_date",
+        ]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 2: Owner Performance (Deals)
+# ---------------------------------------------------------------------------
+
+def get_owner_performance() -> dict:
+    raw = _fetch_all_items(DEALS_BOARD_ID)
+    df  = normalize_deal_funnel(raw)
+
+    # exclude rows with no owner before grouping
+    has_owner = df["owner_code"].apply(lambda v: isinstance(v, str) and v.strip() != "")
+    df_owners = df[has_owner]
+
+    owners = []
+    for owner, grp in df_owners.groupby("owner_code"):
+        total      = len(grp)
+        won        = len(grp[grp["deal_status"] == "won"])
+        dead       = len(grp[grp["deal_status"] == "dead"])
+        open_count = len(grp[grp["deal_status"] == "open"])
+        owners.append({
+            "owner_code":          owner,
+            "total_deals":         total,
+            "won_deals":           won,
+            "win_rate_pct":        round((won / total) * 100, 1) if total else 0,
+            "dead_deals":          dead,
+            "loss_rate_pct":       round((dead / total) * 100, 1) if total else 0,
+            "open_deals":          open_count,
+            "total_won_value":     round(grp[grp["deal_status"] == "won"]["deal_value_masked"].sum(skipna=True), 2),
+            "open_pipeline_value": round(grp[grp["deal_status"] == "open"]["deal_value_masked"].sum(skipna=True), 2),
+        })
+
+    # sort by won value so the best performer appears first
+    owners.sort(key=lambda x: x["total_won_value"], reverse=True)
+
+    dq = _count_missing(df, ["owner_code", "deal_value_masked", "deal_status"])
+    dq["rows_excluded_no_owner"] = int(len(df) - len(df_owners))  # lets the LLM flag unassigned deals
+
+    return {
+        "owner_performance": owners,
+        "data_quality":      dq,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 3: Weighted Pipeline Value (Deals)
+# ---------------------------------------------------------------------------
+
+def get_weighted_pipeline_value() -> dict:
+    """
+    Maps closure probability to numeric weights and computes a
+    probability-adjusted pipeline value for open deals.
+      High -> 75%, Medium -> 50%, Low -> 25%
+    """
+    PROB_WEIGHTS = {"high": 0.75, "medium": 0.50, "low": 0.25}
+
+    raw = _fetch_all_items(DEALS_BOARD_ID)
+    df  = normalize_deal_funnel(raw)
+
+    open_df        = df[df["deal_status"] == "open"].copy()
+    total_raw      = 0.0
+    total_weighted = 0.0
+    breakdown      = []
+
+    for prob_label, weight in PROB_WEIGHTS.items():
+        tier_df    = open_df[open_df["closure_probability"] == prob_label]
+        with_value = tier_df[tier_df["deal_value_masked"].notna()]  # skip deals with no value filled in
+        raw_val    = with_value["deal_value_masked"].sum(skipna=True)
+        weighted   = raw_val * weight
+        total_raw      += raw_val
+        total_weighted += weighted
+
+        breakdown.append({
+            "closure_probability": prob_label,
+            "weight_pct":          int(weight * 100),
+            "deal_count":          len(tier_df),
+            "deals_with_value":    len(with_value),
+            "raw_pipeline_value":  round(raw_val, 2),
+            "weighted_value":      round(weighted, 2),
+        })
+
+    # deals with no probability set are excluded from the weighted calc
+    no_prob = open_df[
+        ~open_df["closure_probability"].isin(list(PROB_WEIGHTS.keys()))
+    ]
+
+    return {
+        "open_deals_total":          len(open_df),
+        "deals_in_weighted_calc":    int(open_df["closure_probability"].isin(list(PROB_WEIGHTS.keys())).sum()),
+        "deals_excluded_no_prob":    len(no_prob),
+        "raw_pipeline_value":        round(total_raw, 2),
+        "weighted_pipeline_value":   round(total_weighted, 2),
+        "breakdown_by_probability":  breakdown,
+        "data_quality":              _count_missing(open_df, [
+            "closure_probability", "deal_value_masked",
+        ]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 4: Revenue Summary (Work Orders)
+# ---------------------------------------------------------------------------
+
+def get_revenue_summary() -> dict:
+    raw = _fetch_all_items(WORK_ORDERS_BOARD_ID)
+    df  = normalize_work_orders(raw)
+
+    # helper to safely sum a column — returns 0 if the column doesn't exist
+    def _sum(col):
+        return round(df[col].sum(skipna=True), 2) if col in df.columns else 0
+
+    return {
+        "total_contracted_excl_gst": _sum("amount_excl_gst_masked"),
+        "total_contracted_incl_gst": _sum("amount_incl_gst_masked"),
+        "total_billed_excl_gst":     _sum("billed_value_excl_gst_masked"),
+        "total_billed_incl_gst":     _sum("billed_value_incl_gst_masked"),
+        "total_collected":           _sum("collected_amount_incl_gst_masked"),
+        "total_unbilled_excl_gst":   _sum("amount_to_be_billed_excl_gst_masked"),
+        "total_receivable":          _sum("amount_receivable_masked"),
+        # status breakdowns — blank values filtered before counting
+        "billing_status_breakdown":  (
+            df[df["billing_status"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+            ["billing_status"].value_counts().to_dict()
+        ),
+        "invoice_status_breakdown":  (
+            df[df["invoice_status"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+            ["invoice_status"].value_counts().to_dict()
+        ),
+        "nature_of_work_breakdown":  (
+            df[df["nature_of_work"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+            ["nature_of_work"].value_counts().to_dict()
+        ),
+        "data_quality": _count_missing(df, [
+            "amount_excl_gst_masked", "amount_incl_gst_masked",
+            "billed_value_excl_gst_masked", "collected_amount_incl_gst_masked",
+            "amount_receivable_masked", "billing_status", "invoice_status", "nature_of_work",
+        ]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: Sector Performance (Work Orders)
+# ---------------------------------------------------------------------------
+
+def get_sector_performance() -> dict:
+    raw = _fetch_all_items(WORK_ORDERS_BOARD_ID)
+    df  = normalize_work_orders(raw)
+
+    # exclude rows with no sector — can't meaningfully group them
+    has_sector = df["sector"].apply(lambda v: isinstance(v, str) and v.strip() != "")
+    df_sector  = df[has_sector]
+
+    sectors = []
+    for sector, grp in df_sector.groupby("sector"):
+        exec_status = (
+            grp[grp["execution_status"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+            ["execution_status"].value_counts().to_dict()
         )
+        sectors.append({
+            "sector":                     sector,
+            "work_order_count":           len(grp),
+            "contracted_excl_gst":        round(grp["amount_excl_gst_masked"].sum(skipna=True), 2),
+            "billed_excl_gst":            round(grp["billed_value_excl_gst_masked"].sum(skipna=True), 2),
+            "collected":                  round(grp["collected_amount_incl_gst_masked"].sum(skipna=True), 2),
+            "receivable":                 round(grp["amount_receivable_masked"].sum(skipna=True), 2),
+            "execution_status_breakdown": exec_status,
+        })
+
+    # sort by contracted value so the biggest sector appears first
+    sectors.sort(key=lambda x: x["contracted_excl_gst"], reverse=True)
+
+    dq = _count_missing(df, [
+        "sector", "amount_excl_gst_masked",
+        "billed_value_excl_gst_masked", "collected_amount_incl_gst_masked", "execution_status",
+    ])
+    dq["rows_excluded_no_sector"] = int(len(df) - len(df_sector))
 
     return {
-        "total_work_orders": len(work_orders),
-        **totals,
-        "billing_efficiency": round(billing_eff, 4),
-        "collection_efficiency": round(collection_eff, 4),
-        "by_sector": by_sector,
-        }
+        "sector_performance": sectors,
+        "data_quality":       dq,
+    }
 
 
-# ── Tool 5: Cross-Board Summary ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Tool 6: Collections Status (Work Orders)
+# ---------------------------------------------------------------------------
 
-def get_cross_board_summary() -> dict:
-    """
-    Compares pipeline (Deals) vs execution (Work Orders) side by side.
-    """
-    deals = fetch_deals()
-    work_orders = fetch_work_orders()
+def get_collections_status() -> dict:
+    raw = _fetch_all_items(WORK_ORDERS_BOARD_ID)
+    df  = normalize_work_orders(raw)
 
-    pipeline = {}   # sector -> {pipeline_value, deal_count}
-    execution = {}  # sector -> {contract_value, work_order_count}
+    # only include work orders that actually have money outstanding
+    receivable_df = df[
+        df["amount_receivable_masked"].notna() &
+        (df["amount_receivable_masked"] > 0)
+    ].sort_values("amount_receivable_masked", ascending=False)
 
-    deal_names = set()
-    wo_names = set()
+    # full list of accounts with outstanding amounts, largest first
+    outstanding = receivable_df[[
+        "deal_name", "customer_name_code", "serial_number", "sector",
+        "amount_receivable_masked", "billed_value_incl_gst_masked",
+        "collected_amount_incl_gst_masked", "ar_priority_account",
+        "billing_status", "wo_status_billed",
+    ]].to_dict(orient="records")
 
-    for deal in deals:
-        s = deal.get("sector") or "Unknown"
-        deal_names.add((deal.get("name") or "").strip().lower())
-        if s not in pipeline:
-            pipeline[s] = {"pipeline_value": 0.0, "deal_count": 0}
-        pipeline[s]["pipeline_value"] += deal.get("deal_value") or 0.0
-        pipeline[s]["deal_count"] += 1
+    # subset flagged as priority by the ops/finance team
+    priority_accounts = (
+        df[df["ar_priority_account"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+        [["deal_name", "customer_name_code", "serial_number",
+          "amount_receivable_masked", "ar_priority_account"]]
+        .to_dict(orient="records")
+    )
 
-    for wo in work_orders:
-        s = wo.get("sector") or "Unknown"
-        wo_names.add((wo.get("name") or "").strip().lower())
-        if s not in execution:
-            execution[s] = {"contract_value": 0.0, "work_order_count": 0}
-        execution[s]["contract_value"] += wo.get("amount_excl_gst") or 0.0
-        execution[s]["work_order_count"] += 1
-
-    # Work orders whose deal name doesn't exist in the Deals board
-    orphaned = wo_names - deal_names
-
-    # Build merged sector view
-    all_sectors = set(pipeline.keys()) | set(execution.keys())
-    by_sector = {}
-    for s in all_sectors:
-        p = pipeline.get(s, {})
-        e = execution.get(s, {})
-        by_sector[s] = {
-            "deal_count":        p.get("deal_count", 0),
-            "pipeline_value":    p.get("pipeline_value", 0.0),
-            "work_order_count":  e.get("work_order_count", 0),
-            "contract_value":    e.get("contract_value", 0.0),
-        }
+    # work orders stuck in pause or waiting on client — likely blocking billing
+    stuck = df[
+        df["execution_status"].apply(
+            lambda v: isinstance(v, str)
+            and v.strip() in {"pause / struck", "details pending from client"}
+        )
+    ][[
+        "deal_name", "customer_name_code", "serial_number",
+        "sector", "execution_status", "amount_receivable_masked",
+    ]].to_dict(orient="records")
 
     return {
-        "by_sector": by_sector,
-        "orphaned_work_orders": len(orphaned),
-        "data_notes": [
-            f"{len(orphaned)} work orders have no matching deal in the Deals board.",
-            f"{len(deal_names - wo_names)} deals have not yet generated a work order.",
-        ],
+        "total_receivable":     round(receivable_df["amount_receivable_masked"].sum(), 2),
+        "outstanding_accounts": outstanding,
+        "priority_ar_accounts": priority_accounts,
+        "wo_status_breakdown":  (
+            df[df["wo_status_billed"].apply(lambda v: isinstance(v, str) and v.strip() != "")]
+            ["wo_status_billed"].value_counts().to_dict()
+        ),
+        "stuck_work_orders":    stuck,
+        "data_quality":         _count_missing(df, [
+            "amount_receivable_masked", "collected_amount_incl_gst_masked",
+            "billed_value_incl_gst_masked", "wo_status_billed",
+            "billing_status", "ar_priority_account", "collection_status", "collection_date",
+        ]),
     }

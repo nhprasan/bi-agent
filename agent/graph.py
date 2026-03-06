@@ -1,305 +1,298 @@
 """
-LangGraph ReAct agent that connects Gemini with Monday.com tools and drives
-the BI conversation. Returns both the final answer and a tool
-trace so app.py can show what the agent did.
+agent/graph.py
+
+BI agent built with LangGraph.
+
+Graph structure:
+    START --> call_llm --> should_continue? --> call_tools --> call_llm (loop)
+                                          \--> END (if no tool calls)
+
+Nodes:
+    call_llm   - sends messages to Groq and gets back a response
+    call_tools - executes whatever tools the LLM asked for
+
+Edges:
+    call_llm --> call_tools   (if LLM response has tool calls)
+    call_llm --> END          (if LLM response has no tool calls — final answer)
+    call_tools --> call_llm   (always loop back after tools run)
 """
 
 import json
 import time
-from typing import Annotated, TypedDict
+from typing import Annotated
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
-from langchain_core.tools import tool
-# from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
-from langgraph.graph import END, StateGraph
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
 
+from config import GROQ_API_KEY
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
-    fetch_deals,
-    fetch_work_orders,
-    get_cross_board_summary,
     get_pipeline_summary,
+    get_owner_performance,
+    get_weighted_pipeline_value,
     get_revenue_summary,
+    get_sector_performance,
+    get_collections_status,
 )
-# from config import GEMINI_API_KEY
-from config import GROQ_API_KEY
+
+
+# max number of nodes LangGraph can visit in one run
+# with 6 tools, 10 is more than enough — prevents infinite loops
+RECURSION_LIMIT = 10
 
 
 # ---------------------------------------------------------------------------
-# 1. Tool Wrappers
+# State
+# LangGraph passes this dict between nodes on every step.
+# add_messages is a reducer — it appends new messages instead of replacing.
 # ---------------------------------------------------------------------------
-# These wrappers expose only clean, well-documented interfaces to Gemini.
-# We return JSON strings because tool outputs must be serializable.
-
-
-@tool
-def tool_get_pipeline_summary(sector: str = "") -> str:
-    """Get pipeline overview grouped by sector and stage."""
-    result = get_pipeline_summary(sector=sector or None)
-    return json.dumps(result, default=str)
-
-
-@tool
-def tool_get_revenue_summary(sector: str = "") -> str:
-    """Get revenue, billing and collection aggregates."""
-    result = get_revenue_summary(sector=sector or None)
-    return json.dumps(result, default=str)
-
-
-@tool
-def tool_get_cross_board_summary() -> str:
-    """Compare pipeline vs execution across sectors."""
-    result = get_cross_board_summary()
-    return json.dumps(result, default=str)
-
-
-@tool
-def tool_fetch_deals(sector: str = "", status: str = "", stage: str = "") -> str:
-    """Fetch deal-level records with optional filters."""
-    results = fetch_deals(
-        sector=sector or None,
-        status=status or None,
-        stage=stage or None,
-    )
-
-    # Limit raw records to avoid blowing up token usage
-    summary = {
-        "total_returned": len(results),
-        "records": results[:10],
-    }
-
-    return json.dumps(summary, default=str)
-
-
-@tool
-def tool_fetch_work_orders(
-    sector: str = "",
-    execution_status: str = "",
-    billing_status: str = "",
-) -> str:
-    """Fetch work-order-level records with optional filters."""
-    results = fetch_work_orders(
-        sector=sector or None,
-        execution_status=execution_status or None,
-        billing_status=billing_status or None,
-    )
-
-    summary = {
-        "total_returned": len(results),
-        "records": results[:10],
-    }
-
-    return json.dumps(summary, default=str)
-
-
-ALL_TOOLS = [
-    tool_get_pipeline_summary,
-    tool_get_revenue_summary,
-    tool_get_cross_board_summary,
-    tool_fetch_deals,
-    tool_fetch_work_orders,
-]
-
-TOOL_MAP = {t.name: t for t in ALL_TOOLS}
-
-
-# ---------------------------------------------------------------------------
-# 2. Agent State
-# ---------------------------------------------------------------------------
-# messages -> conversation history
-# tool_trace -> what tools were executed (for UI panel)
-
 
 class AgentState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
-    tool_trace: list[dict]
+    messages:   Annotated[list, add_messages]
+    tool_trace: list   # accumulates tool call metadata for the UI
 
 
 # ---------------------------------------------------------------------------
-# 3. Build LLM (single instance reused)
+# LLM
 # ---------------------------------------------------------------------------
 
-# LLM = ChatGoogleGenerativeAI(
-#     model="gemini-2.5-flash",
-#     google_api_key=GEMINI_API_KEY,
-#     temperature=0.2,
-#     max_tokens=2048,
-# ).bind_tools(ALL_TOOLS)
-
-LLM = ChatGroq(
+llm = ChatGroq(
     model="llama-3.3-70b-versatile",
     api_key=GROQ_API_KEY,
-    temperature=0.2,
-    max_tokens=2048,
-).bind_tools(ALL_TOOLS, tool_choice="auto")
+    temperature=0,
+)
 
 
 # ---------------------------------------------------------------------------
-# 4. Graph Nodes
+# Tool definitions
 # ---------------------------------------------------------------------------
 
-
-def agent_node(state: AgentState) -> AgentState:
+@tool
+def tool_get_pipeline_summary() -> str:
     """
-    Calls Gemini with system prompt + conversation history.
-    Gemini may return:
-        - final text answer
-        - tool calls
+    Use this tool to answer questions about the sales pipeline.
+    Covers: total pipeline value, deal counts by status and stage,
+    open deals by sector and by owner/BD rep, won deal value.
+    Example questions: 'What is our pipeline?', 'How many open deals do we have?',
+    'Which sector has the most pipeline?', 'What is the total won value?'
     """
-    time.sleep(2)  # spreads requests across time
-    messages_with_system = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    return json.dumps(get_pipeline_summary(), default=str)
 
-    response: AIMessage = LLM.invoke(messages_with_system)
 
+@tool
+def tool_get_owner_performance() -> str:
+    """
+    Use this tool to answer questions about individual BD/sales owner performance.
+    Covers: win rate, loss rate, deal counts, won value, open pipeline per owner.
+    Example questions: 'Who is the best performing BD?', 'What is the win rate per owner?',
+    'Which owner has the most open deals?'
+    """
+    return json.dumps(get_owner_performance(), default=str)
+
+
+@tool
+def tool_get_weighted_pipeline_value() -> str:
+    """
+    Use this tool when the user wants a realistic or probability-adjusted pipeline value.
+    Maps closure probability (High/Medium/Low) to weights (75/50/25%) and computes
+    a weighted pipeline value for open deals.
+    Example questions: 'What is our realistic pipeline?', 'What is the weighted pipeline value?',
+    'How much of the pipeline is likely to close?'
+    """
+    return json.dumps(get_weighted_pipeline_value(), default=str)
+
+
+@tool
+def tool_get_revenue_summary() -> str:
+    """
+    Use this tool to answer questions about overall revenue and financials.
+    Covers: total contracted value, billed amount, collected amount,
+    unbilled amount, receivables, billing and invoice status breakdowns.
+    Example questions: 'What is our total revenue?', 'How much have we billed?',
+    'How much is still unbilled?', 'What is our total contracted value?'
+    """
+    return json.dumps(get_revenue_summary(), default=str)
+
+
+@tool
+def tool_get_sector_performance() -> str:
+    """
+    Use this tool to answer questions about performance broken down by industry sector.
+    Covers: work order count, contracted value, billed, collected and receivable
+    per sector, execution status breakdown per sector.
+    Example questions: 'Which sector generates the most revenue?',
+    'How is mining performing?', 'Compare sectors by billed value.'
+    """
+    return json.dumps(get_sector_performance(), default=str)
+
+
+@tool
+def tool_get_collections_status() -> str:
+    """
+    Use this tool to answer questions about outstanding payments and collections.
+    Covers: total receivables, accounts with outstanding amounts, priority AR accounts,
+    stuck or paused work orders, WO open vs closed status.
+    Example questions: 'How much money is outstanding?', 'Which clients owe us money?',
+    'What are our priority collection accounts?', 'Are there any stuck work orders?'
+    """
+    return json.dumps(get_collections_status(), default=str)
+
+
+TOOLS = [
+    tool_get_pipeline_summary,
+    tool_get_owner_performance,
+    tool_get_weighted_pipeline_value,
+    tool_get_revenue_summary,
+    tool_get_sector_performance,
+    tool_get_collections_status,
+]
+
+llm_with_tools = llm.bind_tools(TOOLS)
+TOOL_MAP       = {t.name: t for t in TOOLS}
+
+
+# ---------------------------------------------------------------------------
+# History trimming — keep last N human+AI exchanges to stay within token limits
+# ---------------------------------------------------------------------------
+
+def _trim_history(chat_history: list, max_exchanges: int = 2) -> list:
+    if not chat_history:
+        return []
+
+    collected       = []
+    exchanges_found = 0
+
+    for msg in reversed(chat_history):
+        collected.insert(0, msg)
+        if isinstance(msg, HumanMessage):
+            exchanges_found += 1
+            if exchanges_found == max_exchanges:
+                break
+
+    return collected
+
+
+# ---------------------------------------------------------------------------
+# Node 1: call_llm
+# Sends the current message list to Groq and appends the response to state.
+# ---------------------------------------------------------------------------
+
+def call_llm(state: AgentState) -> dict:
+    response = llm_with_tools.invoke(state["messages"])
     return {
-        "messages": [response],
+        "messages":   [response],
         "tool_trace": state.get("tool_trace", []),
     }
 
 
-def tools_node(state: AgentState) -> AgentState:
-    """
-    Executes requested tools and sends results back to the LLM.
-    Also records simple execution trace.
-    """
+# ---------------------------------------------------------------------------
+# Node 2: call_tools
+# Runs every tool the LLM asked for and appends ToolMessages back to state.
+# Records timing info into tool_trace for the UI expander.
+# ---------------------------------------------------------------------------
 
-    last_message: AIMessage = state["messages"][-1]
-    tool_calls = last_message.tool_calls or []
+def call_tools(state: AgentState) -> dict:
+    last_message = state["messages"][-1]
+    tool_trace   = list(state.get("tool_trace", []))
+    new_messages = []
 
-    tool_messages = []
-    trace = list(state.get("tool_trace", []))
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call["name"]
+        tool_fn   = TOOL_MAP.get(tool_name)
 
-    for call in tool_calls:
-        tool_name = call["name"]
-        tool_args = call["args"]
-        tool_fn = TOOL_MAP.get(tool_name)
-
-        start = time.time()
-
-        if tool_fn is None:
-            output = json.dumps({"error": f"Unknown tool: {tool_name}"})
+        if not tool_fn:
+            result = json.dumps({"error": f"Tool '{tool_name}' not found."})
+            tool_trace.append({
+                "tool_name":   tool_name,
+                "inputs":      tool_call["args"],
+                "duration_ms": 0,
+            })
         else:
+            start = time.time()
             try:
-                output = tool_fn.invoke(tool_args)
+                result = tool_fn.invoke(tool_call["args"])
             except Exception as e:
-                output = json.dumps({"error": str(e)})
+                result = json.dumps({"error": str(e)})
+            duration_ms = round((time.time() - start) * 1000)
+            tool_trace.append({
+                "tool_name":   tool_name,
+                "inputs":      tool_call["args"],
+                "duration_ms": duration_ms,
+            })
 
-        duration_ms = round((time.time() - start) * 1000)
-
-        trace.append({
-            "tool_name": tool_name,
-            "inputs": tool_args,
-            "duration_ms": duration_ms,
-        })
-
-        tool_messages.append(
-            ToolMessage(
-                content=output,
-                tool_call_id=call["id"],
-                name=tool_name,
-            )
+        new_messages.append(
+            ToolMessage(content=result, tool_call_id=tool_call["id"])
         )
 
     return {
-        "messages": tool_messages,
-        "tool_trace": trace,
+        "messages":   new_messages,
+        "tool_trace": tool_trace,
     }
 
 
 # ---------------------------------------------------------------------------
-# 5. Routing Logic
+# Conditional edge: should_continue
+# Runs after call_llm. Routes to call_tools if there are tool calls,
+# otherwise routes to END — that means the LLM has its final answer.
 # ---------------------------------------------------------------------------
-
 
 def should_continue(state: AgentState) -> str:
-    """
-    If the LLM requested tools → go to tools node.
-    Otherwise → end the loop.
-    """
-    last = state["messages"][-1]
-
-    if isinstance(last, AIMessage) and last.tool_calls:
-        return "tools"
-
-    return "end"
+    if state["messages"][-1].tool_calls:
+        return "call_tools"
+    return END
 
 
 # ---------------------------------------------------------------------------
-# 6. Build Graph
+# Build the graph
 # ---------------------------------------------------------------------------
 
-def _build_graph():
-    graph = StateGraph(AgentState)
+builder = StateGraph(AgentState)
 
-    graph.add_node("agent", agent_node)
-    graph.add_node("tools", tools_node)
+# register nodes
+builder.add_node("call_llm",   call_llm)
+builder.add_node("call_tools", call_tools)
 
-    graph.set_entry_point("agent")
+# fixed edges
+builder.add_edge(START,        "call_llm")
+builder.add_edge("call_tools", "call_llm")  # after tools always go back to LLM
 
-    graph.add_conditional_edges(
-        "agent",
-        should_continue,
-        {"tools": "tools", "end": END},
+# conditional edge after LLM — either call tools or finish
+builder.add_conditional_edges(
+    "call_llm",
+    should_continue,
+    {"call_tools": "call_tools", END: END},
+)
+
+graph = builder.compile()
+
+
+# ---------------------------------------------------------------------------
+# Public entry point called by app.py
+# ---------------------------------------------------------------------------
+
+def run_agent(user_message: str, chat_history: list) -> dict:
+    """
+    Run one turn of the agent.
+
+    Builds the initial state with system prompt + trimmed history + new message,
+    runs the graph, and returns the final answer + tool trace.
+    """
+    initial_messages = (
+        [SystemMessage(content=SYSTEM_PROMPT)]
+        + _trim_history(chat_history, max_exchanges=2)
+        + [HumanMessage(content=user_message)]
     )
 
-    graph.add_edge("tools", "agent")
-
-    return graph.compile()
-
-
-_GRAPH = _build_graph()
-
-
-# ---------------------------------------------------------------------------
-# 7. Public function used by app.py
-# ---------------------------------------------------------------------------
-
-def run_agent(user_message: str, chat_history: list[BaseMessage]) -> dict:
-    """
-    Main entry point.
-
-    app.py sends:
-        - latest user message
-        - full chat history
-
-    Returns:
-        {
-            "answer": str,
-            "tool_trace": list
-        }
-    """
-
-    initial_state: AgentState = {
-        "messages": chat_history + [HumanMessage(content=user_message)],
-        "tool_trace": [],
-    }
-
-    final_state = _GRAPH.invoke(
-        initial_state,
-        config={"recursion_limit": 9},  # prevents runaway tool loops
+    final_state = graph.invoke(
+        {"messages": initial_messages, "tool_trace": []},
+        {"recursion_limit": RECURSION_LIMIT},
     )
-
-    last_message = final_state["messages"][-1]
-
-    content = last_message.content if hasattr(last_message, "content") else str(last_message)
-    
-    if isinstance(content, list):
-        answer = " ".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in content
-        ).strip()
-    else:
-        answer = str(content).strip()
 
     return {
-        "answer": answer,
+        "answer":     final_state["messages"][-1].content,
         "tool_trace": final_state.get("tool_trace", []),
     }

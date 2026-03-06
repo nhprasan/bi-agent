@@ -26,13 +26,13 @@ st.title("📊 Business Intelligence Assistant")
 # ------------------------------------------------------------
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []   # UI messages (dict)
+    st.session_state.messages = []   # rendered chat messages (role + content dicts)
 
 if "history" not in st.session_state:
-    st.session_state.history = []    # BaseMessage objects for agent
+    st.session_state.history = []    # BaseMessage objects passed to the agent
 
 if "traces" not in st.session_state:
-    st.session_state.traces = []     # tool trace per assistant message
+    st.session_state.traces = []     # one tool trace list per assistant message
 
 
 # ------------------------------------------------------------
@@ -50,13 +50,19 @@ if st.button("Clear conversation"):
 # Render chat history
 # ------------------------------------------------------------
 
-for i, msg in enumerate(st.session_state.messages):
+# track assistant messages separately so each maps to the right trace index
+assistant_idx = 0
+
+for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-        # Show tool trace under assistant messages
-        if msg["role"] == "assistant" and i < len(st.session_state.traces):
-            trace = st.session_state.traces[i // 2] if st.session_state.traces else []
+        if msg["role"] == "assistant":
+            trace = (
+                st.session_state.traces[assistant_idx]
+                if assistant_idx < len(st.session_state.traces)
+                else []
+            )
             if trace:
                 with st.expander("Agent actions"):
                     for step in trace:
@@ -65,6 +71,7 @@ for i, msg in enumerate(st.session_state.messages):
                             f"(inputs={step.get('inputs')}, "
                             f"{step.get('duration_ms')} ms)"
                         )
+            assistant_idx += 1  # advance only for assistant messages, not user ones
 
 
 # ------------------------------------------------------------
@@ -75,7 +82,7 @@ user_input = st.chat_input("Ask about pipeline, revenue, deals...")
 
 if user_input:
 
-    # Show user message
+    # show user message immediately
     st.session_state.messages.append(
         {"role": "user", "content": user_input}
     )
@@ -86,17 +93,17 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Run agent
+    # run agent and display response
     with st.chat_message("assistant"):
         with st.spinner("Fetching live data..."):
             try:
                 result = run_agent(
                     user_message=user_input,
-                    chat_history=st.session_state.history[:-1],
+                    chat_history=st.session_state.history[:-1],  # exclude the message we just added
                 )
 
                 answer = result.get("answer", "No response returned.")
-                trace = result.get("tool_trace", [])
+                trace  = result.get("tool_trace", [])
 
                 st.markdown(answer)
 
@@ -109,7 +116,7 @@ if user_input:
                                 f"{step.get('duration_ms')} ms)"
                             )
 
-                # Persist assistant response
+                # persist assistant turn
                 st.session_state.messages.append(
                     {"role": "assistant", "content": answer}
                 )
