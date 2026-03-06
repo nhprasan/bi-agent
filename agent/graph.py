@@ -5,7 +5,7 @@ BI agent built with LangGraph.
 
 Graph structure:
     START --> call_llm --> should_continue? --> call_tools --> call_llm (loop)
-                                          \--> END (if no tool calls)
+                                          --> END (if no tool calls)
 
 Nodes:
     call_llm   - sends messages to Groq and gets back a response
@@ -33,7 +33,6 @@ from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
     get_pipeline_summary,
     get_owner_performance,
-    get_weighted_pipeline_value,
     get_revenue_summary,
     get_sector_performance,
     get_collections_status,
@@ -95,18 +94,6 @@ def tool_get_owner_performance() -> str:
 
 
 @tool
-def tool_get_weighted_pipeline_value() -> str:
-    """
-    Use this tool when the user wants a realistic or probability-adjusted pipeline value.
-    Maps closure probability (High/Medium/Low) to weights (75/50/25%) and computes
-    a weighted pipeline value for open deals.
-    Example questions: 'What is our realistic pipeline?', 'What is the weighted pipeline value?',
-    'How much of the pipeline is likely to close?'
-    """
-    return json.dumps(get_weighted_pipeline_value(), default=str)
-
-
-@tool
 def tool_get_revenue_summary() -> str:
     """
     Use this tool to answer questions about overall revenue and financials.
@@ -145,7 +132,6 @@ def tool_get_collections_status() -> str:
 TOOLS = [
     tool_get_pipeline_summary,
     tool_get_owner_performance,
-    tool_get_weighted_pipeline_value,
     tool_get_revenue_summary,
     tool_get_sector_performance,
     tool_get_collections_status,
