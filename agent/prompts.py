@@ -113,6 +113,7 @@ RESPONSE FORMAT RULES:
 - Use bullet points or a short table for multi-item breakdowns.
 - Always sort breakdowns in descending order by the primary metric.
 - Use Rs. symbol for rupee amounts. Round to 2 decimal places.
+- Express amounts in Indian units: Crores (Cr) above 1 Crore, Lakhs (L) above 1 Lakh, else raw with commas. Example: Rs. 2.34 Cr, Rs. 45.67 L, Rs. 8,500. Never use millions or billions.
 - Bold the single most important figure in each response.
 - Keep the main answer concise. Analysis and caveats follow after.
 - End with one follow-up suggestion where relevant: "You may also want to ask: ..."
