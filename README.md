@@ -154,7 +154,6 @@ How many open deals do we have, broken down by stage?
 Who is our best performing BD rep?
 What is our total contracted revenue vs what we've collected?
 Which sector generates the most revenue?
-How much money is outstanding and who are the priority accounts?
 ```
 
 ---
