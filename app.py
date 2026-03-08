@@ -68,8 +68,7 @@ for msg in st.session_state.messages:
                     for step in trace:
                         st.write(
                             f"• {step.get('tool_name')} "
-                            f"(inputs={step.get('inputs')}, "
-                            f"{step.get('duration_ms')} ms)"
+                            f"({step.get('duration_ms')} ms)"
                         )
             assistant_idx += 1  # advance only for assistant messages, not user ones
 
@@ -112,8 +111,7 @@ if user_input:
                         for step in trace:
                             st.write(
                                 f"• {step.get('tool_name')} "
-                                f"(inputs={step.get('inputs')}, "
-                                f"{step.get('duration_ms')} ms)"
+                                f"({step.get('duration_ms')} ms)"
                             )
 
                 # persist assistant turn

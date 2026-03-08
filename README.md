@@ -85,20 +85,22 @@ User (Streamlit UI)
 
 | Board | What it covers |
 |---|---|
-| **Deal Funnel** | All deals — open, won, dead, on hold. Deal value, stage, sector, BD owner, closure probability, dates. |
-| **Work Orders** | All contracted work. Contracted value, billed, collected, receivables, execution status, invoice status. |
+| **Deal Funnel** | All deals — open, won, dead, on hold. Deal value, sector, BD owner assignments, dead deal value lost. |
+| **Work Orders** | All contracted work. Contracted value, billed, collected, unbilled, receivables. Execution status, invoice status, WO open/closed status. Nature of work (one-time, monthly, annual RC, POC). BD/KAM owner per work order. Customer-level outstanding amounts. |
 
 ---
 
 ## Available Tools
 
+No tools take arguments. Each tool fetches the full board and returns all data — the LLM extracts what's relevant to the user's question. This avoids Groq's strict null-argument validation errors with optional parameters.
+
 | Tool | Answers questions about |
 |---|---|
-| `get_pipeline_summary` | Pipeline value, deal counts by status/stage, open deals by sector and owner |
-| `get_owner_performance` | Win rate, loss rate, won value, open pipeline per BD owner |
-| `get_revenue_summary` | Total contracted value, billed, collected, unbilled, receivables |
-| `get_sector_performance` | Revenue, billed, collected, receivables broken down by sector |
-| `get_collections_status` | Outstanding payments, priority AR accounts, stuck work orders |
+| `get_pipeline_summary` | Pipeline value, won value, dead deal value lost, deal counts by status, sector breakdown, open pipeline by BD owner |
+| `get_owner_performance` | Deal counts, won value, dead deal value, open pipeline, avg won deal size — for all owners |
+| `get_revenue_summary` | Total contracted, billed, collected, unbilled, receivables. Breakdown by nature of work and by BD/KAM owner. Invoice status counts. |
+| `get_sector_performance` | Contracted, billed, collected, unbilled, receivable per sector. Execution status, invoice status, and WO open/closed breakdown per sector. |
+| `get_collections_status` | Total receivables, customer-level outstanding amounts ranked by size, execution status × receivable/unbilled, stuck work orders |
 
 ---
 
@@ -150,10 +152,17 @@ streamlit run app.py
 
 ```
 What is our current pipeline value?
-How many open deals do we have, broken down by stage?
 Who is our best performing BD rep?
+How much value have we lost in dead deals?
 What is our total contracted revenue vs what we've collected?
 Which sector generates the most revenue?
+How is Mining performing?
+How much money is outstanding and which customers owe us the most?
+What work orders are stuck or paused?
+How are monthly contracts performing financially?
+Which BD/KAM manages the most contracted value on work orders?
+How is OWNER_003 performing on deals?
+Show me the Railways pipeline.
 ```
 
 ---
@@ -169,6 +178,7 @@ All domain configuration lives in `config.py`:
 | `SECTOR_CANONICAL` | Normalizes sector name variants to a single canonical form |
 | `DEAL_NUMERIC_COLS` / `WORK_ORDER_NUMERIC_COLS` | Columns cast to float for aggregation |
 | `KNOWN_HEADER_LABELS` | Labels used to drop embedded header rows from Monday exports |
+| `DEALS_DQ_COLS` / `WO_DQ_COLS` | Standard column lists passed to the data quality checker in each tool |
 
 ---
 
@@ -178,6 +188,8 @@ All domain configuration lives in `config.py`:
 - **No time-series** — the agent works with current board state only; historical trend analysis is not supported
 - **Token management** — conversation history is trimmed to the last 2 exchanges to stay within LLM context limits
 - **Recursion limit** — the graph is capped at 10 node visits per turn to prevent infinite loops
+- **Tool definitions** — all tools are decorated with `@tool` and defined in `tools.py`; `graph.py` only handles graph wiring and the LLM loop
+- **No tool arguments** — tools return full board data; the LLM filters and extracts what's relevant in its response. This avoids Groq's null-argument schema validation errors.
 
 ---
 
