@@ -151,18 +151,18 @@ streamlit run app.py
 ## Example Questions
 
 ```
-What is our current pipeline value?
-Who is our best performing BD rep?
-How much value have we lost in dead deals?
-What is our total contracted revenue vs what we've collected?
-Which sector generates the most revenue?
-How is Mining performing?
+What is our current pipeline value and how is it split by sector?
+Who is our best performing BD rep and what is their win rate?
+Which sector has lost the most value in dead deals?
+What is our total contracted revenue vs what we've billed and collected?
+Which sector generates the most revenue and how much is still unbilled?
+How is Mining performing on work orders?
 How much money is outstanding and which customers owe us the most?
-What work orders are stuck or paused?
-How are monthly contracts performing financially?
+What work orders are stuck or paused and how much value is at risk?
+How are monthly contracts performing vs one-time projects?
 Which BD/KAM manages the most contracted value on work orders?
-How is OWNER_003 performing on deals?
-Show me the Railways pipeline.
+Compare our pipeline by sector vs our actual revenue by sector.
+What is the execution status breakdown for Renewables?
 ```
 
 ---
@@ -179,6 +179,8 @@ All domain configuration lives in `config.py`:
 | `DEAL_NUMERIC_COLS` / `WORK_ORDER_NUMERIC_COLS` | Columns cast to float for aggregation |
 | `KNOWN_HEADER_LABELS` | Labels used to drop embedded header rows from Monday exports |
 | `DEALS_DQ_COLS` / `WO_DQ_COLS` | Standard column lists passed to the data quality checker in each tool |
+
+---
 
 ## License
 
