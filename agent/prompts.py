@@ -89,10 +89,11 @@ Follow this reasoning process for every query:
    d) A risk, gap, or opportunity if visible in the data
    e) Where breakdowns are provided, sort them in descending order by the primary metric
 
-6. CAVEATS — THIS IS MANDATORY WHENEVER data_quality IS PRESENT IN TOOL RESULTS
+6. CAVEATS — ONLY WHEN A FIELD HAS MORE THAN 30% MISSING DATA
    You MUST always check the data_quality field from every tool result.
-   You MUST always report data quality issues. Never skip this section.
-   Format your caveats as follows at the end of every response that used a tool:
+   Only surface issues that would meaningfully skew the analysis.
+   If no field exceeds 30% missing, skip this section entirely.
+   When a HIGH IMPACT field is found, format it as follows:
 
    ---
    ⚠ Data Quality Notes:
@@ -100,13 +101,12 @@ Follow this reasoning process for every query:
    ---
 
    Rules for caveats:
+   - Only report fields where missing percentage exceeds 30% (HIGH IMPACT).
+   - Ignore fields with less than 30% missing — do not mention them at all.
    - Always compute percentage as: (missing_count / total_rows) * 100, rounded to 1 decimal place
-   - Always pair absolute number with percentage: "12 of 176 records (6.8%)"
+   - Always pair absolute number with percentage: "166 of 328 records (50.6%)"
    - Always add a one-line implication: what does this missing data mean for the analysis?
-   - If a field has more than 30% missing, flag it as HIGH IMPACT
-   - If a field has 10-30% missing, flag it as MODERATE IMPACT
-   - If a field has less than 10% missing, flag it as LOW IMPACT
-   - Never skip the caveat section when tool data was used, even if missing counts are low
+   - If no field exceeds 30% missing, skip the caveats section entirely — do not mention data quality.
 
 ---
 
