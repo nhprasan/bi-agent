@@ -180,19 +180,6 @@ All domain configuration lives in `config.py`:
 | `KNOWN_HEADER_LABELS` | Labels used to drop embedded header rows from Monday exports |
 | `DEALS_DQ_COLS` / `WO_DQ_COLS` | Standard column lists passed to the data quality checker in each tool |
 
----
-
-## Notes
-
-- **Data is masked** — client identities and deal values use anonymized codes as configured in Monday.com
-- **No time-series** — the agent works with current board state only; historical trend analysis is not supported
-- **Token management** — conversation history is trimmed to the last 2 exchanges to stay within LLM context limits
-- **Recursion limit** — the graph is capped at 10 node visits per turn to prevent infinite loops
-- **Tool definitions** — all tools are decorated with `@tool` and defined in `tools.py`; `graph.py` only handles graph wiring and the LLM loop
-- **No tool arguments** — tools return full board data; the LLM filters and extracts what's relevant in its response. This avoids Groq's null-argument schema validation errors.
-
----
-
 ## License
 
 MIT
